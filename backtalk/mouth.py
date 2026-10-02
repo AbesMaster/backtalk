@@ -60,6 +60,64 @@ _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 _pipe = None
 _pipe_lock = threading.Lock()
 
+_speaker_warned = False
+
+
+def _speaker_index():
+    """Resolve the OUTPUT device to a concrete index, every time a stream
+    opens.
+
+    A concrete index and never None-for-default, because None is exactly
+    what hides the failure this function exists to catch: PortAudio
+    renumbers its device list whenever something connects or disconnects
+    (ears._mic_index measured a USB mic moving the default pair from
+    [-1, 1] to [1, 3], silently changing the OUTPUT device too), and a
+    stream already bound to the old number keeps accepting writes and
+    plays them into nothing. Resolving to a real number lets _get_out see
+    the move and rebuild instead of talking to a device that is no longer
+    there.
+
+    speaker_device pins it by NAME when set: exact name wins, then the
+    first case-insensitive substring, so a precise name can never be
+    beaten by a loose one. Falls back to the system default, and returns
+    None only if even that cannot be determined -- the voice degrades, it
+    never goes mute.
+    """
+    global _speaker_warned
+    want = str(CFG.get("speaker_device", "") or "").strip()
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        log(f"[mouth] could not list audio devices ({e}) -- using the "
+            f"default speaker")
+        return None
+    outs = [(i, d) for i, d in enumerate(devices)
+            if d.get("max_output_channels", 0) > 0]
+    if want:
+        for i, d in outs:
+            if d["name"] == want:
+                _speaker_warned = False
+                return i
+        low = want.lower()
+        for i, d in outs:
+            if low in d["name"].lower():
+                _speaker_warned = False
+                return i
+        if not _speaker_warned:     # once per disappearance, not per sentence
+            _speaker_warned = True
+            log(f"[mouth] speaker_device {want!r} not found -- using the "
+                f"system default. Outputs I can see: "
+                f"{[d['name'] for _, d in outs]}")
+    # System default, pinned down to the number it means RIGHT NOW.
+    try:
+        dev = sd.default.device[1]
+        if isinstance(dev, int) and dev >= 0:
+            return dev
+    except Exception:
+        pass
+    return outs[0][0] if outs else None
+
+
 
 def _ensure_espeak():
     """kokoro phonemizes through system espeak-ng (its bundled loader
@@ -338,10 +396,21 @@ class Mouth:
         self._q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._speaking = threading.Event()
+        # Work accepted but not yet finished playing. THE RACE THIS CLOSES:
+        # the worker pops an item off the queue and only then sets
+        # _speaking, so for that instant the queue is empty AND nothing is
+        # marked speaking. wait_done sampling in that window concluded the
+        # speech was over before a sample had been synthesised -- which
+        # made `python -m backtalk.mouth` (the voice audition in the setup
+        # guide) exit instantly and kill its own daemon worker, so
+        # auditioning a voice played silence and reported no error.
+        self._pending = 0
+        self._pending_lock = threading.Lock()
         # The one persistent output stream (audio law #1).
         # Worker-thread-only — never touch from other threads.
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
+        self._out_dev: int | None = None
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
@@ -350,9 +419,18 @@ class Mouth:
     def speaking(self) -> bool:
         return self._speaking.is_set()
 
+    def _took_on(self, n: int = 1):
+        with self._pending_lock:
+            self._pending += n
+
+    def _finished(self, n: int = 1):
+        with self._pending_lock:
+            self._pending = max(0, self._pending - n)
+
     def say(self, text: str):
         """Queue text (split to sentences) for speech."""
         for s in split_sentences(text):
+            self._took_on()
             self._q.put((s, None))
 
     def say_chunk(self, text: str, directions=None):
@@ -365,16 +443,21 @@ class Mouth:
         is why they travel with it instead of firing at parse time."""
         text = text.strip()
         if text:
+            self._took_on()
             self._q.put((text, directions or None))
 
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued."""
         self._stop.set()
+        dropped = 0
         try:
             while True:
                 self._q.get_nowait()
+                dropped += 1
         except queue.Empty:
             pass
+        if dropped:
+            self._finished(dropped)
 
     def shutdown(self):
         """Exit path: stop playback and restore the music SYNCHRONOUSLY
@@ -386,7 +469,7 @@ class Mouth:
         """Block until the queue is drained and playback finished."""
         import time
         deadline = None if timeout is None else time.time() + timeout
-        while (not self._q.empty()) or self._speaking.is_set():
+        while self._pending > 0 or self._speaking.is_set():
             time.sleep(0.05)
             if deadline and time.time() > deadline:
                 return
@@ -397,6 +480,7 @@ class Mouth:
             item = self._q.get()
             sentence, directions = item if isinstance(item, tuple) else (item, None)
             if not sentence:
+                self._finished()
                 continue
             self._stop.clear()
             self._speaking.set()
@@ -408,6 +492,7 @@ class Mouth:
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
+                self._finished()
                 if self._q.empty():
                     self._speaking.clear()
                     # The reply has genuinely stopped talking, as opposed to
@@ -417,10 +502,19 @@ class Mouth:
                     signals.set_state("idle")
 
     def _get_out(self, rate: int) -> sd.OutputStream:
-        """The long-lived stream (audio law #1). Reopened only when the
-        sample rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback:
-        rare, costs at most one blip on the switch)."""
-        if self._out is not None and self._out_rate == rate:
+        """The long-lived stream (audio law #1). Reopened when the sample
+        rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback: rare,
+        costs at most one blip on the switch) -- and when the output
+        device MOVES, which is the silent killer.
+
+        A stream bound to a device index that has since been renumbered
+        does not raise and does not go inactive. It accepts every write
+        and plays them nowhere, so the log fills with sentences the room
+        never heard. Re-resolving the device on every chunk and comparing
+        is the only thing that catches it; see _speaker_index."""
+        dev = _speaker_index()
+        if (self._out is not None and self._out_rate == rate
+                and self._out_dev == dev):
             # Guarded, because the stream can die UNDER us: the ears
             # rebuild the whole audio system to recover from a device
             # change (see ears._reopen_after_device_change), and that
@@ -434,10 +528,27 @@ class Mouth:
                 return self._out
             except Exception:
                 log("[mouth] the output stream went away, reopening")
+        elif self._out is not None and self._out_dev != dev:
+            log(f"[mouth] the output device moved ({self._out_dev} -> "
+                f"{dev}) -- rebuilding the stream so the voice keeps "
+                f"reaching the speakers")
         self._drop_out()
-        self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+        try:
+            self._out = sd.OutputStream(samplerate=rate, channels=1,
+                                        dtype="int16", device=dev)
+            self._out.start()
+        except Exception as e:
+            # The device was resolved a moment ago and will not open:
+            # unplugged in between, busy, or refusing the rate. Fall back
+            # to whatever the OS calls the default rather than going mute.
+            log(f"[mouth] could not open output device {dev} ({e}) -- "
+                f"falling back to the system default")
+            self._out = sd.OutputStream(samplerate=rate, channels=1,
+                                        dtype="int16")
+            self._out.start()
+            dev = None
         self._out_rate = rate
-        self._out.start()
+        self._out_dev = dev
         return self._out
 
     def _cut(self):
@@ -464,6 +575,7 @@ class Mouth:
                 pass
         self._out = None
         self._out_rate = None
+        self._out_dev = None
 
     def _play_stream(self, sentence: str, directions=None, block: int = 2205,
                      prebuffer_s: float = 0.75):

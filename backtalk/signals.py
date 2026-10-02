@@ -40,6 +40,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
@@ -62,7 +63,9 @@ _THINKING_SOUND = CFG.get("thinking_sound") or ""
 
 _WAVEFORM_MIN_INTERVAL = 1.0 / 15   # ~15 writes/sec is plenty for 60fps reads
 _last_waveform_write = 0.0
-_static_proc: subprocess.Popen | None = None
+_VOL = 0.35                 # matches the old afplay -v 0.35
+_static_halt = threading.Event()
+_static_thread: threading.Thread | None = None
 
 
 def set_state(name: str):
@@ -187,32 +190,95 @@ def _player_cmd(path: str) -> list[str] | None:
     return None
 
 
+def _static_afplay(path, halt):
+    """Fallback player: the original afplay, restarted until told to stop."""
+    cmd = _player_cmd(path)
+    if not cmd:
+        return
+    while not halt.is_set():
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        except OSError:
+            return
+        while p.poll() is None and not halt.is_set():
+            time.sleep(0.1)
+        if p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+            return
+
+
+def _static_stream(path, halt):
+    """Loop the clip, on the SAME speaker the voice comes out of.
+
+    Two bugs met here. The clip is 36 seconds and used to play exactly
+    once, so any think longer than that finished in silence - and the
+    visualiser deliberately stays quiet while .voice_loading_pid exists,
+    so nothing else filled the gap either. And afplay follows the SYSTEM
+    DEFAULT device while mouth pins the voice by NAME, because PortAudio
+    renumbers its device list whenever the iPhone joins or leaves. The
+    two can therefore land on different outputs: the reply is audible and
+    the thinking sound plays into nothing.
+
+    Resolving through _speaker_index keeps them together, and re-resolving
+    on every pass means a device that moves mid-think is picked up on the
+    next loop instead of going silent until the next restart.
+    """
+    import wave
+    try:
+        import sounddevice as sd
+        from backtalk.mouth import _speaker_index
+    except Exception:
+        return _static_afplay(path, halt)
+    while not halt.is_set():
+        try:
+            with wave.open(path, "rb") as w:
+                fr, ch = w.getframerate(), w.getnchannels()
+                with sd.OutputStream(samplerate=fr, channels=ch,
+                                     dtype="float32",
+                                     device=_speaker_index()) as out:
+                    while not halt.is_set():
+                        raw = w.readframes(2048)
+                        if not raw:
+                            break          # clip ended - loop round again
+                        a = (np.frombuffer(raw, dtype=np.int16)
+                             .astype(np.float32) / 32768.0 * _VOL)
+                        out.write(a.reshape(-1, ch))
+        except Exception:
+            # A device that vanished mid-stream, or no PortAudio at all.
+            return _static_afplay(path, halt)
+
+
 def static_start():
-    """Optional thinking sound — plays while the brain works."""
-    global _static_proc
+    """Optional thinking sound - loops while the brain works."""
+    global _static_thread
     if not _THINKING_SOUND or not os.path.exists(_THINKING_SOUND):
         return
     static_stop()
-    cmd = _player_cmd(_THINKING_SOUND)
-    if not cmd:
-        return
+    _static_halt.clear()
+    t = threading.Thread(target=_static_stream,
+                         args=(_THINKING_SOUND, _static_halt), daemon=True)
+    _static_thread = t
+    t.start()
     try:
-        _static_proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with open(_LOADING_PID_FILE, "w") as f:
-            f.write(str(_static_proc.pid))
+            f.write(str(os.getpid()))
     except OSError:
-        _static_proc = None
+        pass
 
 
 def static_stop():
-    global _static_proc
-    if _static_proc is not None:
-        try:
-            _static_proc.terminate()
-        except OSError:
-            pass
-        _static_proc = None
+    global _static_thread
+    _static_halt.set()
+    t, _static_thread = _static_thread, None
+    if t is not None and t.is_alive():
+        # Chunks are ~46ms, so this returns almost immediately. It is a
+        # join rather than fire-and-forget because the very next thing the
+        # caller does is open its own stream on the same device.
+        t.join(timeout=0.5)
     try:
         os.remove(_LOADING_PID_FILE)
     except OSError:

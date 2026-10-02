@@ -286,6 +286,17 @@ class WarmBrain:
 
         try:
             drained = await asyncio.wait_for(_drain(), timeout)
+            if drained == 0:
+                # THE DEAD-STREAM HOLE: a genuinely dirty turn always has
+                # at least its own ResultMessage still to drain, so zero
+                # is impossible on a live pipe. It means receive_response()
+                # ENDED instead of blocking — the stream is closed. That
+                # raises nothing and times out never, so without this the
+                # drain below reports success, marks the pipe clean, and
+                # hands every later query to a dead stream: the brain goes
+                # silent for the rest of the run and only a restart fixes
+                # it. Raise so the rebuild path below takes over.
+                raise RuntimeError("stream closed: drained 0 messages")
             log(f"[brain] interrupted turn drained ({drained} stale messages)")
             self._dirty = False
         except Exception:

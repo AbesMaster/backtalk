@@ -155,6 +155,22 @@ DEFAULTS = {
     #
     # NOT "stt_device" below, which is the Whisper COMPUTE device.
     "mic_device": "",
+    # The speaker to play through, matched by NAME. "" means whatever the
+    # OS calls the default output, re-resolved every time a stream opens.
+    #
+    # Same reasoning as mic_device above, and the same hazard seen from
+    # the other end: indices shift every time a device connects or
+    # disconnects. A phone offering itself as a Continuity audio device is
+    # enough to renumber the list under a stream that is ALREADY OPEN, and
+    # a stream still bound to the old index keeps accepting audio and
+    # plays it nowhere -- the voice goes silent with no error anywhere,
+    # which is the worst failure this program has.
+    #
+    # A name and never an index. Exact name wins, then the first
+    # case-insensitive substring. A name matching nothing falls back to
+    # the default and logs the outputs it did find; the voice degrades,
+    # it never goes mute.
+    "speaker_device": "",
     # Optional premium voice: ElevenLabs on YOUR key. The key NEVER
     # goes in a file: it's read from the macOS Keychain (item
     # `backtalk-elevenlabs`) or Linux secret-tool, with the

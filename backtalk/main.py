@@ -579,6 +579,9 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
+_EMPTY_TURNS = {"n": 0}
+
+
 async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
@@ -630,6 +633,34 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
             # will ever dequeue, so nothing resets the bus — park it here.
             signals.static_stop()
             signals.set_state("idle")
+            # SAY SO. A turn that yields nothing used to be completely
+            # silent: no reply, no log line, no spoken word. From the
+            # room it is indistinguishable from the agent ignoring you,
+            # and the log shows your question with no answer under it and
+            # no reason why. The common cause is the brain refusing every
+            # query while still CONNECTING fine, so "[backtalk] brain
+            # warm" prints and nothing downstream ever contradicts it.
+            # MEASURED, 2026-10-02: across 101 of these in the field, the
+            # cause was a dead message stream after an interrupted turn
+            # (see reset_turn in brain.py), never an expired login — the
+            # OAuth token auto-refreshes and was valid every single time.
+            # Do not send anyone to /login on the strength of this line.
+            log(f"[{NAME}] EMPTY TURN — the brain returned no text. "
+                f"Check the line above this one FIRST: if it says the "
+                f"turn drained 0 stale messages, the stream died and "
+                f"that is the cause — not the login. Otherwise check "
+                f"usage limits, then the login "
+                f"(`claude` then /login) as the LAST thing, not the "
+                f"first: an expired login is rare and the token "
+                f"auto-refreshes.")
+            _EMPTY_TURNS["n"] += 1
+            # Speak it once per run, not every turn: the first silence is
+            # a mystery worth breaking, the tenth is just noise.
+            if _EMPTY_TURNS["n"] == 1:
+                mouth.say("I heard you, but my brain returned nothing. "
+                          "The message stream most likely died. I'm "
+                          "rebuilding the session, so try me again. "
+                          "Your login is almost certainly fine.")
     except asyncio.CancelledError:
         try:
             await brain.interrupt()
